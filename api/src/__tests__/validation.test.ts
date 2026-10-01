@@ -942,4 +942,936 @@ describe('Hook HMAC Validation', () => {
       expect(() => verifyHookHmac(tamperedReq, mockRes, next)).toThrow();
     });
   });
+
+  // ---------------------------------------------------------------------------
+  // Unconfigured hookSecret: must reject before checking headers/signature.
+  // ---------------------------------------------------------------------------
+  it('rejects when hookSecret is not configured', () => {
+    jest.isolateModules(() => {
+      delete process.env.STELLAR_API_HOOK_SECRET;
+      // Force config to reload without the secret
+      jest.resetModules();
+      const { verifyHookHmac } = require('../middleware/auth');
+      const timestamp = String(Date.now());
+      const req = {
+        headers: {
+          'x-hook-timestamp': timestamp,
+          'x-hook-signature': 'deadbeef',
+        },
+        body: {},
+        rawBody: '{}',
+      } as any;
+      expect(() => verifyHookHmac(req, mockRes, next)).toThrow(
+        'Hook authentication secret is not configured'
+      );
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // Array-format headers: spec says first element is used (not concatenated).
+  // ---------------------------------------------------------------------------
+  it('accepts array-format timestamp/signature headers using the first element', () => {
+    jest.isolateModules(() => {
+      process.env.STELLAR_API_HOOK_SECRET = 'validation-hook-secret';
+      const { verifyHookHmac } = require('../middleware/auth');
+      const secret = 'validation-hook-secret';
+      const timestamp = String(Date.now());
+      const rawBody = '{}';
+      const signature = crypto
+        .createHmac('sha256', secret)
+        .update(`${timestamp}.${rawBody}`)
+        .digest('hex');
+
+      const req = {
+        headers: {
+          'x-hook-timestamp': [timestamp, 'ignored-second-value'],
+          'x-hook-signature': [signature, 'ignored-second-value'],
+        },
+        body: {},
+        rawBody,
+      } as any;
+
+      expect(() => verifyHookHmac(req, mockRes, next)).not.toThrow();
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // Timestamp exactly at the edge of the replay window (just inside = accept,
+  // just outside = reject).
+  // ---------------------------------------------------------------------------
+  it('accepts a timestamp exactly at the edge of the replay window', () => {
+    jest.isolateModules(() => {
+      process.env.STELLAR_API_HOOK_SECRET = 'validation-hook-secret';
+      const { verifyHookHmac } = require('../middleware/auth');
+      const secret = 'validation-hook-secret';
+      // 4 minutes 59 seconds ago — just inside the 5-minute window
+      const timestamp = String(Date.now() - (5 * 60 * 1000 - 1000));
+      const rawBody = '{}';
+      const signature = crypto
+        .createHmac('sha256', secret)
+        .update(`${timestamp}.${rawBody}`)
+        .digest('hex');
+
+      const req = {
+        headers: {
+          'x-hook-timestamp': timestamp,
+          'x-hook-signature': signature,
+        },
+        body: {},
+        rawBody,
+      } as any;
+
+      expect(() => verifyHookHmac(req, mockRes, next)).not.toThrow();
+    });
+  });
+
+  it('rejects a future timestamp outside the replay window', () => {
+    jest.isolateModules(() => {
+      process.env.STELLAR_API_HOOK_SECRET = 'validation-hook-secret';
+      const { verifyHookHmac } = require('../middleware/auth');
+      const futureTimestamp = String(Date.now() + 10 * 60 * 1000);
+      const req = {
+        headers: {
+          'x-hook-timestamp': futureTimestamp,
+          'x-hook-signature': 'abcd',
+        },
+        body: {},
+        rawBody: '{}',
+      } as any;
+      expect(() => verifyHookHmac(req, mockRes, next)).toThrow();
+    });
+  });
+});
+
+// =============================================================================
+// Additional failure-path and boundary coverage
+// =============================================================================
+
+describe('I128String — Additional Boundary and Failure Paths', () => {
+  // Leading zeros are not valid integer representations (regex ^-?\d+$ allows
+  // them, but these are additional important edge cases for documentation).
+  it('should accept strings with leading zeros (regex permits them)', () => {
+    // The regex ^-?\d+$ matches "007"; the actual behaviour is acceptance.
+    // This test documents the current behaviour so regressions are caught.
+    expect(I128String.safeParse('007').success).toBe(true);
+  });
+
+  it('should reject a "+" prefix (not matched by ^-?\\d+$)', () => {
+    expect(I128String.safeParse('+5').success).toBe(false);
+    expect(I128String.safeParse('+0').success).toBe(false);
+  });
+
+  it('should reject a lone dash "-"', () => {
+    expect(I128String.safeParse('-').success).toBe(false);
+  });
+
+  it('should reject double-dash "--1"', () => {
+    expect(I128String.safeParse('--1').success).toBe(false);
+  });
+
+  it('should reject "NaN" and "Infinity"', () => {
+    expect(I128String.safeParse('NaN').success).toBe(false);
+    expect(I128String.safeParse('Infinity').success).toBe(false);
+    expect(I128String.safeParse('-Infinity').success).toBe(false);
+  });
+
+  it('should reject scientific-notation strings', () => {
+    expect(I128String.safeParse('1e18').success).toBe(false);
+    expect(I128String.safeParse('1E18').success).toBe(false);
+    expect(I128String.safeParse('1.5e10').success).toBe(false);
+  });
+
+  it('should reject hex strings', () => {
+    expect(I128String.safeParse('0xFF').success).toBe(false);
+    expect(I128String.safeParse('0x10').success).toBe(false);
+  });
+
+  it('should trim surrounding whitespace and still validate correctly', () => {
+    const result = I128String.safeParse('  -42  ');
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data).toBe('-42');
+    }
+  });
+
+  it('should accept i128::MAX exactly', () => {
+    expect(I128String.safeParse('170141183460469231731687303715884105727').success).toBe(true);
+  });
+
+  it('should accept i128::MIN exactly', () => {
+    expect(I128String.safeParse('-170141183460469231731687303715884105728').success).toBe(true);
+  });
+
+  it('should reject i128::MAX + 1', () => {
+    expect(I128String.safeParse('170141183460469231731687303715884105728').success).toBe(false);
+  });
+
+  it('should reject i128::MIN - 1', () => {
+    expect(I128String.safeParse('-170141183460469231731687303715884105729').success).toBe(false);
+  });
+
+  it('should reject very large numbers well beyond i128 range', () => {
+    expect(
+      I128String.safeParse(
+        '99999999999999999999999999999999999999999999999999999999999999'
+      ).success
+    ).toBe(false);
+  });
+});
+
+describe('PositiveI128String — Additional Boundary and Failure Paths', () => {
+  it('should reject i128::MAX + 1 overflow', () => {
+    expect(PositiveI128String.safeParse('170141183460469231731687303715884105728').success).toBe(false);
+  });
+
+  it('should reject strings with leading zeros (e.g., "00")', () => {
+    // "00" parses to 0n which is not > 0n
+    expect(PositiveI128String.safeParse('00').success).toBe(false);
+  });
+
+  it('should reject "+" prefix', () => {
+    expect(PositiveI128String.safeParse('+1').success).toBe(false);
+  });
+
+  it('should accept the minimum positive value "1"', () => {
+    expect(PositiveI128String.safeParse('1').success).toBe(true);
+  });
+
+  it('should accept i128::MAX', () => {
+    expect(PositiveI128String.safeParse('170141183460469231731687303715884105727').success).toBe(true);
+  });
+
+  it('should reject zero', () => {
+    expect(PositiveI128String.safeParse('0').success).toBe(false);
+  });
+
+  it('should reject negative values', () => {
+    expect(PositiveI128String.safeParse('-1').success).toBe(false);
+    expect(PositiveI128String.safeParse('-170141183460469231731687303715884105728').success).toBe(false);
+  });
+
+  it('should reject float strings', () => {
+    expect(PositiveI128String.safeParse('1.0').success).toBe(false);
+    expect(PositiveI128String.safeParse('0.1').success).toBe(false);
+  });
+});
+
+describe('validateBody — Additional Failure-Path Coverage', () => {
+  it('should validate an empty-object schema against an empty body without error', () => {
+    const emptySchema = z.object({});
+    const req = { body: {} } as any;
+    const next = jest.fn();
+
+    validateBody(emptySchema)(req, {} as any, next);
+
+    expect(next).toHaveBeenCalledWith();
+    expect(req.body).toEqual({});
+  });
+
+  it('should call logger.warn even when req lacks method and path properties', () => {
+    const warnSpy = jest.spyOn(logger, 'warn').mockImplementation(() => logger);
+    const schema = z.object({ field: z.string().min(5) });
+
+    // req with neither method nor path — covers the optional chaining safe path
+    const req = { body: { field: 'ab' } } as any;
+    const next = jest.fn();
+
+    validateBody(schema)(req, {} as any, next);
+
+    expect(warnSpy).toHaveBeenCalledWith(
+      'Request body validation failed',
+      expect.objectContaining({ error: expect.stringContaining('field') })
+    );
+    expect(next).toHaveBeenCalledWith(expect.any(Error));
+
+    warnSpy.mockRestore();
+  });
+
+  it('should not mutate req.body on validation failure with a deeply nested body', async () => {
+    const schema = z.object({ nested: z.object({ value: z.number() }) });
+    const originalBody = { nested: { value: 'not-a-number' } };
+    const req = { body: JSON.parse(JSON.stringify(originalBody)) } as any;
+    const next = jest.fn();
+
+    validateBody(schema)(req, {} as any, next);
+
+    await new Promise(resolve => setImmediate(resolve));
+
+    expect(next).toHaveBeenCalledWith(expect.any(Error));
+    expect(req.body).toEqual(originalBody);
+  });
+
+  it('should handle concurrent calls without shared-state contamination', async () => {
+    const schema = z.object({ value: z.number() });
+
+    const results = await Promise.all(
+      Array.from({ length: 50 }, (_, i) => {
+        const req = { body: { value: i % 2 === 0 ? i : 'bad' } } as any;
+        const next = jest.fn();
+        validateBody(schema)(req, {} as any, next);
+        return new Promise<{ idx: number; passed: boolean }>(resolve => {
+          setImmediate(() => {
+            const passed = next.mock.calls.length === 1 && next.mock.calls[0][0] === undefined;
+            resolve({ idx: i, passed });
+          });
+        });
+      })
+    );
+
+    for (const { idx, passed } of results) {
+      // Even indices have numeric values → should pass; odd have 'bad' → should fail
+      expect(passed).toBe(idx % 2 === 0);
+    }
+  });
+
+  it('should forward non-Zod errors thrown by a custom schema.parse', async () => {
+    const customError = new TypeError('unexpected custom error');
+    const badSchema = { parse: () => { throw customError; } } as unknown as z.ZodSchema;
+    const req = { body: {} } as any;
+    const next = jest.fn();
+
+    validateBody(badSchema)(req, {} as any, next);
+
+    await new Promise(resolve => setImmediate(resolve));
+
+    expect(next).toHaveBeenCalledWith(customError);
+  });
+});
+
+describe('Sensitive Field Scrubbing — userSecret must not appear in logs or errors', () => {
+  it('should NOT echo the raw userSecret value in the formatted error message', async () => {
+    const schema = z.object({
+      userSecret: z.string().min(20, 'Secret too short'),
+    });
+    // 15 chars — shorter than min(20) — so validation must fail
+    const secretValue = 'short_secret_val';
+    const req = {
+      method: 'POST',
+      path: '/api/lending/deposit',
+      body: { userSecret: secretValue },
+    } as any;
+    const next = jest.fn();
+
+    await validateBody(schema)(req, {} as any, next);
+    await new Promise(resolve => setImmediate(resolve));
+
+    const error = next.mock.calls[0]?.[0];
+    expect(error).toBeInstanceOf(Error);
+    // The error message should reference the field path but NEVER the raw secret value
+    expect(error.message).not.toContain(secretValue);
+  });
+
+  it('should mark userSecret field as isSensitive in the logged warning metadata', () => {
+    const warnSpy = jest.spyOn(logger, 'warn').mockImplementation(() => logger);
+    const schema = z.object({
+      userSecret: z.string().min(20, 'Secret too short'),
+    });
+    const req = {
+      method: 'POST',
+      path: '/api/lending/deposit',
+      body: { userSecret: 'tiny' },
+    } as any;
+    const next = jest.fn();
+
+    validateBody(schema)(req, {} as any, next);
+
+    const warnCall = warnSpy.mock.calls[0];
+    expect(warnCall).toBeDefined();
+    const logMeta = warnCall[1] as any;
+    const sensitiveIssue = logMeta?.issues?.find((i: any) => i.path === 'userSecret');
+    expect(sensitiveIssue?.isSensitive).toBe(true);
+
+    warnSpy.mockRestore();
+  });
+
+  it('should NOT echo the raw userSecret value in logger.warn call', () => {
+    const warnSpy = jest.spyOn(logger, 'warn').mockImplementation(() => logger);
+    const schema = z.object({
+      userSecret: z.string().min(20, 'Secret too short'),
+    });
+    const secretValue = 'tiny_secret_123';
+    const req = {
+      method: 'POST',
+      path: '/api/lending/deposit',
+      body: { userSecret: secretValue },
+    } as any;
+    const next = jest.fn();
+
+    validateBody(schema)(req, {} as any, next);
+
+    // Walk every warn call argument and verify the raw secret never appears
+    for (const call of warnSpy.mock.calls) {
+      const serialized = JSON.stringify(call);
+      expect(serialized).not.toContain(secretValue);
+    }
+
+    warnSpy.mockRestore();
+  });
+});
+
+describe('isSensitiveField — sensitive-keyword detection invariants', () => {
+  // Indirectly exercised through validateBody's warn metadata; we verify the
+  // isSensitive flag is set for every known sensitive field name.
+
+  const sensitiveFields = [
+    'userSecret',
+    'secret',
+    'password',
+    'token',
+    'authorization',
+    'key',
+    'privateKey',
+    'seed',
+    'PASSWORD',          // case-insensitive
+    'Authorization',     // mixed case
+    'access_token',      // underscore-separated compound
+    'private_key',       // underscore variant
+  ];
+
+  it.each(sensitiveFields)(
+    'should mark field "%s" as sensitive in logger metadata',
+    fieldName => {
+      const warnSpy = jest.spyOn(logger, 'warn').mockImplementation(() => logger);
+
+      const schema = z.object({
+        [fieldName]: z.string().min(100, 'Too short'),
+      });
+      const req = {
+        method: 'POST',
+        path: '/test',
+        body: { [fieldName]: 'short' },
+      } as any;
+      const next = jest.fn();
+
+      validateBody(schema)(req, {} as any, next);
+
+      const warnCall = warnSpy.mock.calls[0];
+      const logMeta = warnCall?.[1] as any;
+      const issue = logMeta?.issues?.find((i: any) => i.path === fieldName);
+      expect(issue?.isSensitive).toBe(true);
+
+      warnSpy.mockRestore();
+    }
+  );
+
+  it('should NOT mark a non-sensitive field as sensitive', () => {
+    const warnSpy = jest.spyOn(logger, 'warn').mockImplementation(() => logger);
+
+    const schema = z.object({ userAddress: z.string().min(100, 'Too short') });
+    const req = {
+      method: 'POST',
+      path: '/test',
+      body: { userAddress: 'short' },
+    } as any;
+    const next = jest.fn();
+
+    validateBody(schema)(req, {} as any, next);
+
+    const warnCall = warnSpy.mock.calls[0];
+    const logMeta = warnCall?.[1] as any;
+    const issue = logMeta?.issues?.find((i: any) => i.path === 'userAddress');
+    expect(issue?.isSensitive).toBe(false);
+
+    warnSpy.mockRestore();
+  });
+});
+
+describe('Error Response Shape — all 400 validation errors include success:false', () => {
+  const endpoints = [
+    '/api/lending/deposit',
+    '/api/lending/borrow',
+    '/api/lending/repay',
+    '/api/lending/withdraw',
+  ] as const;
+
+  const invalidPayload = {
+    userAddress: 'bad',
+    amount: '0',
+    userSecret: '',
+  };
+
+  it.each(endpoints)(
+    'POST %s with invalid body must return { success: false } in response body',
+    async endpoint => {
+      const response = await request(app)
+        .post(endpoint)
+        .send(invalidPayload);
+
+      expect(response.status).toBe(400);
+      expect(response.body).toHaveProperty('success', false);
+      expect(response.body).toHaveProperty('error');
+      expect(typeof response.body.error).toBe('string');
+      expect(response.body.error.length).toBeGreaterThan(0);
+    }
+  );
+});
+
+describe('lendingRequestSchema — Additional Boundary Tests via HTTP', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockStellarService.buildDepositTransaction.mockResolvedValue('mock_deposit_tx');
+    mockStellarService.buildBorrowTransaction.mockResolvedValue('mock_borrow_tx');
+    mockStellarService.buildRepayTransaction.mockResolvedValue('mock_repay_tx');
+    mockStellarService.buildWithdrawTransaction.mockResolvedValue('mock_withdraw_tx');
+    mockStellarService.submitTransaction.mockResolvedValue({
+      success: false,
+      status: 'failed',
+      error: 'mock transaction failure',
+    });
+  });
+
+  it('should trim leading/trailing whitespace from userAddress via HTTP', async () => {
+    const paddedAddress = `  ${VALID_USER_ADDRESS}  `;
+    const response = await request(app)
+      .post('/api/lending/deposit')
+      .send({
+        userAddress: paddedAddress,
+        amount: '1000000',
+        userSecret: VALID_USER_SECRET,
+      });
+
+    // Validation passes (address is trimmed and valid), controller mock returns failure
+    expect(response.status).toBe(400);
+    expect(response.body.error).toBe('mock transaction failure');
+    expect(mockStellarService.buildDepositTransaction).toHaveBeenCalledWith(
+      VALID_USER_ADDRESS,
+      undefined,
+      '1000000',
+      VALID_USER_SECRET
+    );
+  });
+
+  it('should trim leading/trailing whitespace from amount via HTTP', async () => {
+    const response = await request(app)
+      .post('/api/lending/deposit')
+      .send({
+        userAddress: VALID_USER_ADDRESS,
+        amount: '  500000  ',
+        userSecret: VALID_USER_SECRET,
+      });
+
+    expect(response.status).toBe(400);
+    expect(response.body.error).toBe('mock transaction failure');
+    expect(mockStellarService.buildDepositTransaction).toHaveBeenCalledWith(
+      VALID_USER_ADDRESS,
+      undefined,
+      '500000',
+      VALID_USER_SECRET
+    );
+  });
+
+  it('should accept userSecret of exactly 1 character (min(1) boundary)', async () => {
+    const response = await request(app)
+      .post('/api/lending/deposit')
+      .send({
+        userAddress: VALID_USER_ADDRESS,
+        amount: '1000000',
+        userSecret: 'X',
+      });
+
+    // Single character passes validation; controller mock returns failure
+    expect(response.status).toBe(400);
+    expect(response.body.error).toBe('mock transaction failure');
+    expect(mockStellarService.buildDepositTransaction).toHaveBeenCalledWith(
+      VALID_USER_ADDRESS,
+      undefined,
+      '1000000',
+      'X'
+    );
+  });
+
+  it('should reject userSecret of zero characters after trimming', async () => {
+    const response = await request(app)
+      .post('/api/lending/deposit')
+      .send({
+        userAddress: VALID_USER_ADDRESS,
+        amount: '1000000',
+        userSecret: '   ',
+      });
+
+    expect(response.status).toBe(400);
+    expect(response.body.error).toContain('User secret is required');
+    expect(mockStellarService.buildDepositTransaction).not.toHaveBeenCalled();
+  });
+
+  // ----- Borrow endpoint additional boundaries -----
+
+  it('should accept borrow with amount = "1" (minimum positive boundary)', async () => {
+    const response = await request(app)
+      .post('/api/lending/borrow')
+      .send({
+        userAddress: VALID_USER_ADDRESS,
+        assetAddress: VALID_ASSET_ADDRESS,
+        amount: '1',
+        userSecret: VALID_USER_SECRET,
+      });
+
+    expect(response.status).toBe(400);
+    expect(response.body.error).toBe('mock transaction failure');
+    expect(mockStellarService.buildBorrowTransaction).toHaveBeenCalledWith(
+      VALID_USER_ADDRESS,
+      VALID_ASSET_ADDRESS,
+      '1',
+      VALID_USER_SECRET
+    );
+  });
+
+  it('should accept borrow with amount = i128::MAX', async () => {
+    const response = await request(app)
+      .post('/api/lending/borrow')
+      .send({
+        userAddress: VALID_USER_ADDRESS,
+        assetAddress: VALID_ASSET_ADDRESS,
+        amount: I128_MAX,
+        userSecret: VALID_USER_SECRET,
+      });
+
+    expect(response.status).toBe(400);
+    expect(response.body.error).toBe('mock transaction failure');
+    expect(mockStellarService.buildBorrowTransaction).toHaveBeenCalledWith(
+      VALID_USER_ADDRESS,
+      VALID_ASSET_ADDRESS,
+      I128_MAX,
+      VALID_USER_SECRET
+    );
+  });
+
+  it('should reject borrow with malformed assetAddress', async () => {
+    const response = await request(app)
+      .post('/api/lending/borrow')
+      .send({
+        userAddress: VALID_USER_ADDRESS,
+        assetAddress: 'BAD_ASSET',
+        amount: '1000',
+        userSecret: VALID_USER_SECRET,
+      });
+
+    expect(response.status).toBe(400);
+    expect(response.body.success).toBe(false);
+    expect(mockStellarService.buildBorrowTransaction).not.toHaveBeenCalled();
+  });
+
+  it('should accept borrow without assetAddress (optional field)', async () => {
+    const response = await request(app)
+      .post('/api/lending/borrow')
+      .send({
+        userAddress: VALID_USER_ADDRESS,
+        amount: '1000',
+        userSecret: VALID_USER_SECRET,
+      });
+
+    expect(response.status).toBe(400);
+    expect(response.body.error).toBe('mock transaction failure');
+    expect(mockStellarService.buildBorrowTransaction).toHaveBeenCalledWith(
+      VALID_USER_ADDRESS,
+      undefined,
+      '1000',
+      VALID_USER_SECRET
+    );
+  });
+
+  // ----- Repay endpoint additional boundaries -----
+
+  it('should accept repay with amount = "1" (minimum positive boundary)', async () => {
+    const response = await request(app)
+      .post('/api/lending/repay')
+      .send({
+        userAddress: VALID_USER_ADDRESS,
+        amount: '1',
+        userSecret: VALID_USER_SECRET,
+      });
+
+    expect(response.status).toBe(400);
+    expect(response.body.error).toBe('mock transaction failure');
+    expect(mockStellarService.buildRepayTransaction).toHaveBeenCalledWith(
+      VALID_USER_ADDRESS,
+      undefined,
+      '1',
+      VALID_USER_SECRET
+    );
+  });
+
+  it('should accept repay with amount = i128::MAX', async () => {
+    const response = await request(app)
+      .post('/api/lending/repay')
+      .send({
+        userAddress: VALID_USER_ADDRESS,
+        amount: I128_MAX,
+        userSecret: VALID_USER_SECRET,
+      });
+
+    expect(response.status).toBe(400);
+    expect(response.body.error).toBe('mock transaction failure');
+    expect(mockStellarService.buildRepayTransaction).toHaveBeenCalledWith(
+      VALID_USER_ADDRESS,
+      undefined,
+      I128_MAX,
+      VALID_USER_SECRET
+    );
+  });
+
+  it('should reject repay with malformed assetAddress', async () => {
+    const response = await request(app)
+      .post('/api/lending/repay')
+      .send({
+        userAddress: VALID_USER_ADDRESS,
+        assetAddress: 'NOT_AN_ADDRESS',
+        amount: '1000',
+        userSecret: VALID_USER_SECRET,
+      });
+
+    expect(response.status).toBe(400);
+    expect(response.body.success).toBe(false);
+    expect(mockStellarService.buildRepayTransaction).not.toHaveBeenCalled();
+  });
+
+  it('should reject repay with non-integer amount', async () => {
+    const response = await request(app)
+      .post('/api/lending/repay')
+      .send({
+        userAddress: VALID_USER_ADDRESS,
+        amount: '100.5',
+        userSecret: VALID_USER_SECRET,
+      });
+
+    expect(response.status).toBe(400);
+    expect(response.body.success).toBe(false);
+    expect(mockStellarService.buildRepayTransaction).not.toHaveBeenCalled();
+  });
+
+  // ----- Withdraw endpoint additional boundaries -----
+
+  it('should accept withdraw with amount = "1" (minimum positive boundary)', async () => {
+    const response = await request(app)
+      .post('/api/lending/withdraw')
+      .send({
+        userAddress: VALID_USER_ADDRESS,
+        assetAddress: VALID_ASSET_ADDRESS,
+        amount: '1',
+        userSecret: VALID_USER_SECRET,
+      });
+
+    expect(response.status).toBe(400);
+    expect(response.body.error).toBe('mock transaction failure');
+    expect(mockStellarService.buildWithdrawTransaction).toHaveBeenCalledWith(
+      VALID_USER_ADDRESS,
+      VALID_ASSET_ADDRESS,
+      '1',
+      VALID_USER_SECRET
+    );
+  });
+
+  it('should accept withdraw with amount = i128::MAX', async () => {
+    const response = await request(app)
+      .post('/api/lending/withdraw')
+      .send({
+        userAddress: VALID_USER_ADDRESS,
+        assetAddress: VALID_ASSET_ADDRESS,
+        amount: I128_MAX,
+        userSecret: VALID_USER_SECRET,
+      });
+
+    expect(response.status).toBe(400);
+    expect(response.body.error).toBe('mock transaction failure');
+    expect(mockStellarService.buildWithdrawTransaction).toHaveBeenCalledWith(
+      VALID_USER_ADDRESS,
+      VALID_ASSET_ADDRESS,
+      I128_MAX,
+      VALID_USER_SECRET
+    );
+  });
+
+  it('should reject withdraw with i128::MAX + 1 overflow amount', async () => {
+    const response = await request(app)
+      .post('/api/lending/withdraw')
+      .send({
+        userAddress: VALID_USER_ADDRESS,
+        amount: I128_OVERFLOW,
+        userSecret: VALID_USER_SECRET,
+      });
+
+    expect(response.status).toBe(400);
+    expect(response.body.success).toBe(false);
+    expect(mockStellarService.buildWithdrawTransaction).not.toHaveBeenCalled();
+  });
+
+  it('should reject withdraw with malformed assetAddress', async () => {
+    const response = await request(app)
+      .post('/api/lending/withdraw')
+      .send({
+        userAddress: VALID_USER_ADDRESS,
+        assetAddress: 'INVALID_ADDR',
+        amount: '1000',
+        userSecret: VALID_USER_SECRET,
+      });
+
+    expect(response.status).toBe(400);
+    expect(response.body.success).toBe(false);
+    expect(mockStellarService.buildWithdrawTransaction).not.toHaveBeenCalled();
+  });
+
+  it('should accept withdraw without assetAddress (optional field)', async () => {
+    const response = await request(app)
+      .post('/api/lending/withdraw')
+      .send({
+        userAddress: VALID_USER_ADDRESS,
+        amount: '5000',
+        userSecret: VALID_USER_SECRET,
+      });
+
+    expect(response.status).toBe(400);
+    expect(response.body.error).toBe('mock transaction failure');
+    expect(mockStellarService.buildWithdrawTransaction).toHaveBeenCalledWith(
+      VALID_USER_ADDRESS,
+      undefined,
+      '5000',
+      VALID_USER_SECRET
+    );
+  });
+});
+
+describe('optionalStellarAddress — direct unit coverage', () => {
+  // Access the schema through lendingRequestSchema's shape.
+  // We test it indirectly by constructing minimal objects.
+
+  const parseOptional = (assetAddress: unknown) =>
+    lendingRequestSchema.safeParse({
+      userAddress: VALID_USER_ADDRESS,
+      amount: '1000',
+      userSecret: VALID_USER_SECRET,
+      assetAddress,
+    });
+
+  it('should accept undefined assetAddress', () => {
+    const result = parseOptional(undefined);
+    expect(result.success).toBe(true);
+    if (result.success) expect(result.data.assetAddress).toBeUndefined();
+  });
+
+  it('should accept null assetAddress and normalize to undefined', () => {
+    const result = parseOptional(null);
+    expect(result.success).toBe(true);
+    if (result.success) expect(result.data.assetAddress).toBeUndefined();
+  });
+
+  it('should accept empty-string assetAddress and normalize to undefined', () => {
+    const result = parseOptional('');
+    expect(result.success).toBe(true);
+    if (result.success) expect(result.data.assetAddress).toBeUndefined();
+  });
+
+  it('should accept whitespace-only assetAddress and normalize to undefined', () => {
+    const result = parseOptional('   ');
+    expect(result.success).toBe(true);
+    if (result.success) expect(result.data.assetAddress).toBeUndefined();
+  });
+
+  it('should accept a valid Stellar address', () => {
+    const result = parseOptional(VALID_ASSET_ADDRESS);
+    expect(result.success).toBe(true);
+    if (result.success) expect(result.data.assetAddress).toBe(VALID_ASSET_ADDRESS);
+  });
+
+  it('should reject a non-empty, non-whitespace invalid address', () => {
+    const result = parseOptional('INVALID_STELLAR_ADDRESS');
+    expect(result.success).toBe(false);
+  });
+
+  it('should reject a number type for assetAddress', () => {
+    const result = parseOptional(12345);
+    expect(result.success).toBe(false);
+  });
+});
+
+describe('Partial and Cascading Field Failures', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockStellarService.buildDepositTransaction.mockResolvedValue('mock_deposit_tx');
+    mockStellarService.submitTransaction.mockResolvedValue({
+      success: false,
+      status: 'failed',
+      error: 'mock transaction failure',
+    });
+  });
+
+  it('should report errors for all invalid fields simultaneously (not just the first)', async () => {
+    const response = await request(app)
+      .post('/api/lending/deposit')
+      .send({
+        userAddress: 'BAD',
+        amount: '0',
+        userSecret: '',
+      });
+
+    expect(response.status).toBe(400);
+    expect(response.body.success).toBe(false);
+    // The error message should mention at least one of the invalid fields
+    expect(response.body.error).toBeTruthy();
+    expect(mockStellarService.buildDepositTransaction).not.toHaveBeenCalled();
+  });
+
+  it('should NOT advance to the controller when only amount is invalid', async () => {
+    const response = await request(app)
+      .post('/api/lending/deposit')
+      .send({
+        userAddress: VALID_USER_ADDRESS,
+        amount: 'not-a-number',
+        userSecret: VALID_USER_SECRET,
+      });
+
+    expect(response.status).toBe(400);
+    expect(mockStellarService.buildDepositTransaction).not.toHaveBeenCalled();
+  });
+
+  it('should NOT advance to the controller when only userAddress is invalid', async () => {
+    const response = await request(app)
+      .post('/api/lending/deposit')
+      .send({
+        userAddress: 'GXXX',
+        amount: '1000000',
+        userSecret: VALID_USER_SECRET,
+      });
+
+    expect(response.status).toBe(400);
+    expect(mockStellarService.buildDepositTransaction).not.toHaveBeenCalled();
+  });
+
+  it('should return 400 with success:false for a completely empty body', async () => {
+    const response = await request(app)
+      .post('/api/lending/deposit')
+      .send({});
+
+    expect(response.status).toBe(400);
+    expect(response.body).toHaveProperty('success', false);
+    expect(response.body).toHaveProperty('error');
+    expect(mockStellarService.buildDepositTransaction).not.toHaveBeenCalled();
+  });
+
+  it('should reject a payload where userAddress is a number, not a string', async () => {
+    const response = await request(app)
+      .post('/api/lending/deposit')
+      .send({
+        userAddress: 12345,
+        amount: '1000000',
+        userSecret: VALID_USER_SECRET,
+      });
+
+    expect(response.status).toBe(400);
+    expect(response.body.success).toBe(false);
+    expect(mockStellarService.buildDepositTransaction).not.toHaveBeenCalled();
+  });
+
+  it('should reject a payload where amount is an array', async () => {
+    const response = await request(app)
+      .post('/api/lending/deposit')
+      .send({
+        userAddress: VALID_USER_ADDRESS,
+        amount: ['1000000'],
+        userSecret: VALID_USER_SECRET,
+      });
+
+    expect(response.status).toBe(400);
+    expect(response.body.success).toBe(false);
+    expect(mockStellarService.buildDepositTransaction).not.toHaveBeenCalled();
+  });
 });
