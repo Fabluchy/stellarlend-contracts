@@ -5,31 +5,7 @@ import { I128String, PositiveI128String, StellarAddress } from '../utils/validat
 import logger from '../utils/logger';
 
 /**
- * Sensitive field patterns to identify authorization credentials and secrets.
- * Any issue on these paths will be scrubbed to prevent leaking credentials in diagnostics.
- */
-const SENSITIVE_FIELD_NAMES = new Set([
-  'usersecret',
-  'secret',
-  'password',
-  'token',
-  'authorization',
-  'key',
-  'privatekey',
-  'seed',
-]);
-
-function sanitizeFieldName(path: string): string {
-  return path.toLowerCase().replace(/[^a-z0-9]/g, '');
-}
-
-function isSensitiveField(path: string): boolean {
-  const normalized = sanitizeFieldName(path);
-  return Array.from(SENSITIVE_FIELD_NAMES).some(sensitive => normalized.includes(sensitive));
-}
-
-/**
- * Express middleware factory that validates the request body against a Zod schema.
+ * Body validation middleware.
  *
  * Invariants enforced by validateBody:
  * 1. Determinism: Identical input payloads always produce the exact same validation
@@ -58,6 +34,21 @@ export const validateBody =
     let parsed: unknown;
     try {
       parsed = schema.parse(req.body);
+ * Invariants:
+ *  - The request body is replaced with the parsed, normalized value only after a successful parse.
+ *  - On failure the body is left untouched and a deterministic ValidationError is forwarded
+ *    to the error handler via `next(`.
+ *  - Non-Zod errors are propagated unchanged so they are not mislabeled as validation failures.
+ *  - Error messages include the field path but never echo the received value, so secrets are not leaked.
+ */
+export const validateBody =
+  (schema: ZodSchema) => (req: Request, _res: Response, next: NextFunction) => {
+    try {
+      const parsed = schema.parse(req.body);
+      // Only mutate the body after a successful parse to avoid leaving partially
+      // normalized state on failure.
+      req.body = parsed;
+      return next();
     } catch (error) {
       if (
         error instanceof Error &&
@@ -178,6 +169,8 @@ const optionalStellarAddress = z.preprocess(
     if (typeof value === 'string' && value.trim() === '') return undefined;
     return value;
   },
+export const optionalStellarAddress = z.preprocess(
+  value => (value === '' ? undefined : value),
   StellarAddress.optional()
 );
 
