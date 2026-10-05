@@ -45,34 +45,89 @@ function isSensitiveField(path: string): boolean {
  *    request method, path, and error summaries while strictly redacting sensitive fields.
  * 6. Error Propagation: ZodError issues are formatted into a single ValidationError.
  *    Non-Zod errors are forwarded via next(err) without alteration.
+ * 7. Termination: `next` is invoked exactly once for every invocation of the middleware,
+ *    on every path — success, synchronous rejection, asynchronous rejection, and when the
+ *    schema adapter itself misbehaves. This guarantee is what stops a request from hanging
+ *    (invariant 8 below); a middleware that never calls `next` leaves the socket open.
+ * 8. No Escaping Failures: Every failure is funnelled through `next`, so nothing is
+ *    discarded as an unhandled rejection. Express 4 ignores the promise returned by an
+ *    async middleware, so a throw on that promise is silently lost.
  */
 export const validateBody =
   (schema: ZodSchema) => async (req: Request, res: Response, next: NextFunction) => {
+    let parsed: unknown;
     try {
-      const parsed = schema.parse(req.body);
-      req.body = parsed;
-      next();
+      parsed = schema.parse(req.body);
     } catch (error) {
       if (
         error instanceof Error &&
         error.message.includes('Encountered Promise during synchronous parse') &&
         typeof (schema as any).parseAsync === 'function'
       ) {
-        (schema as any)
-          .parseAsync(req.body)
-          .then((validatedBody: any) => {
-            req.body = validatedBody;
-            next();
-          })
-          .catch((asyncError: unknown) => {
-            handleValidationFailure(asyncError, req, next);
-          });
+        await handleAsyncParse(schema, req, next);
         return;
       }
 
       handleValidationFailure(error, req, next);
+      return;
     }
+
+    // Deliberately outside the try/catch. If a downstream handler throws, Express must
+    // receive that error directly; catching it here would report a downstream failure
+    // as a validation failure and invoke `next` a second time.
+    req.body = parsed;
+    next();
   };
+
+/**
+ * Runs an asynchronous schema and routes its outcome to `next` exactly once.
+ *
+ * Failure modes this guards against, all of which previously escaped the middleware
+ * and left the request hanging forever:
+ * - `parseAsync` throws synchronously instead of returning a rejected promise.
+ * - `parseAsync` returns a non-thenable value, so `.then(...)` itself throws.
+ * - `parseAsync` rejects with a non-ZodError (forwarded verbatim, not masked).
+ *
+ * A downstream handler that itself throws is *not* treated as a validation failure:
+ * `next` is invoked outside the promise chain's rejection path, so Express remains the
+ * single owner of post-validation error handling.
+ */
+async function handleAsyncParse(
+  schema: ZodSchema,
+  req: Request,
+  next: NextFunction,
+): Promise<void> {
+  let pending: unknown;
+  try {
+    pending = (schema as any).parseAsync(req.body);
+  } catch (syncError) {
+    handleValidationFailure(syncError, req, next);
+    return;
+  }
+
+  // A schema adapter that returns a non-thenable would make the original `.then(...)`
+  // throw a TypeError outside the rejection path, leaving the request hanging.
+  if (typeof (pending as any)?.then !== 'function') {
+    handleValidationFailure(
+      new Error('Schema parseAsync did not return a promise'),
+      req,
+      next,
+    );
+    return;
+  }
+
+  try {
+    const validatedBody = await (pending as Promise<unknown>);
+    req.body = validatedBody;
+  } catch (asyncError) {
+    handleValidationFailure(asyncError, req, next);
+    return;
+  }
+
+  // Deliberately outside the try/catch: if a downstream handler throws, Express must
+  // receive that error directly rather than it being re-reported as a validation failure.
+  next();
+}
 
 /**
  * Handles validation failures with safe logging and standardized error propagation.

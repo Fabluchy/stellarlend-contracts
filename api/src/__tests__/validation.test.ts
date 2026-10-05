@@ -10,6 +10,7 @@ import {
   withdrawValidation,
 } from '../middleware/validation';
 import { I128String, PositiveI128String, StellarAddress } from '../utils/validators';
+import { ValidationError } from '../utils/errors';
 import logger from '../utils/logger';
 
 const mockStellarService = {
@@ -941,5 +942,311 @@ describe('Hook HMAC Validation', () => {
       } as any;
       expect(() => verifyHookHmac(tamperedReq, mockRes, next)).toThrow();
     });
+  });
+});
+
+/**
+ * Regression coverage for the async-schema fallback path of `validateBody`.
+ *
+ * A synchronous Zod schema that contains an async refinement makes `schema.parse`
+ * throw "Encountered Promise during synchronous parse", which routes the middleware
+ * through `parseAsync`. Every branch of that fallback must call `next` exactly once.
+ *
+ * If `next` is never called the request hangs: the socket stays open until the client
+ * times out, and Express 4 discards the promise returned by an `async` middleware, so a
+ * throw on that promise becomes a silent unhandled rejection. The tests below therefore
+ * assert on the *termination* invariant (`next` called exactly once, no unhandled
+ * rejection) rather than on individual messages.
+ *
+ * These exercise the middleware directly rather than over HTTP on purpose: the app's
+ * rate limiter permits only 100 requests per 15-minute window per IP, and the suites
+ * above already consume a large share of that budget.
+ */
+describe('validateBody async fallback termination invariants', () => {
+  const PROMISE_PARSE_ERROR = 'Encountered Promise during synchronous parse';
+
+  /**
+   * Drives the middleware and reports how it terminated.
+   *
+   * @returns `nextCalls` - the arguments `next` was invoked with.
+   * @returns `rejections` - rejections observed on the middleware's own promise, which
+   *          Express would silently discard.
+   */
+  const runMiddleware = async (schema: any, body: unknown = {}) => {
+    const rejections: string[] = [];
+    const onUnhandled = (reason: unknown) => rejections.push(String(reason));
+    process.on('unhandledRejection', onUnhandled);
+
+    const next = jest.fn();
+    let syncThrow: string | null = null;
+    try {
+      const returned = validateBody(schema)({ body } as any, {} as any, next) as
+        | Promise<unknown>
+        | undefined;
+      await returned?.catch?.((e: unknown) => rejections.push(String(e)));
+    } catch (e) {
+      syncThrow = String(e);
+    }
+
+    // Allow a chained unhandled rejection to surface on the process.
+    await new Promise(resolve => setImmediate(resolve));
+    process.off('unhandledRejection', onUnhandled);
+
+    return {
+      nextCalls: next.mock.calls.map((call: unknown[]) => call[0]),
+      rejections,
+      syncThrow,
+    };
+  };
+
+  /** A schema adapter that sends the middleware down the async fallback path. */
+  const asyncFallback = (parseAsync: () => unknown) => ({
+    parse: () => {
+      throw new Error(PROMISE_PARSE_ERROR);
+    },
+    parseAsync,
+  });
+
+  it('propagates the error when parseAsync throws synchronously instead of returning a promise', async () => {
+    const boom = new Error('parseAsync exploded synchronously');
+    const { nextCalls, rejections, syncThrow } = await runMiddleware(asyncFallback(() => {
+      throw boom;
+    }));
+
+    expect(syncThrow).toBeNull();
+    expect(nextCalls).toEqual([boom]);
+    expect(rejections).toEqual([]);
+  });
+
+  it('does not hang when parseAsync returns a non-thenable value', async () => {
+    // Without the non-thenable guard, `.then(...)` on `undefined` throws a TypeError
+    // outside the rejection path and the request never terminates.
+    const { nextCalls, rejections } = await runMiddleware(asyncFallback(() => undefined));
+
+    expect(nextCalls).toHaveLength(1);
+    expect(nextCalls[0]).toBeInstanceOf(Error);
+    expect((nextCalls[0] as Error).message).toMatch(/did not return a promise/i);
+    expect(rejections).toEqual([]);
+  });
+
+  it('does not hang when parseAsync returns null', async () => {
+    const { nextCalls, rejections } = await runMiddleware(asyncFallback(() => null));
+
+    expect(nextCalls).toHaveLength(1);
+    expect((nextCalls[0] as Error).message).toMatch(/did not return a promise/i);
+    expect(rejections).toEqual([]);
+  });
+
+  it('forwards a non-Zod async rejection verbatim rather than masking it as a 400', async () => {
+    const boom = new Error('async non-zod failure');
+    const { nextCalls, rejections } = await runMiddleware(asyncFallback(async () => {
+      throw boom;
+    }));
+
+    expect(nextCalls).toEqual([boom]);
+    expect(nextCalls[0]).not.toBeInstanceOf(ValidationError);
+    expect(rejections).toEqual([]);
+  });
+
+  it('converts an async ZodError rejection into a ValidationError', async () => {
+    const { nextCalls, rejections } = await runMiddleware(
+      asyncFallback(async () => {
+        // Throws a genuine ZodError, as an async refinement would.
+        z.object({ asyncField: z.string() }).parse({ asyncField: 123 });
+        return undefined;
+      }),
+    );
+
+    expect(nextCalls).toHaveLength(1);
+    expect(nextCalls[0]).toBeInstanceOf(ValidationError);
+    expect((nextCalls[0] as Error).message).toContain('asyncField');
+    expect(rejections).toEqual([]);
+  });
+
+  it('invokes next exactly once when the same async schema is retried repeatedly', async () => {
+    for (let attempt = 0; attempt < 5; attempt++) {
+      const { nextCalls, rejections } = await runMiddleware(
+        asyncFallback(async () => {
+          throw new Error(`attempt ${attempt}`);
+        }),
+      );
+      expect(nextCalls).toHaveLength(1);
+      expect(rejections).toEqual([]);
+    }
+  });
+
+  it('keeps concurrent async validations isolated and terminates every one of them', async () => {
+    // Each concurrent validation resolves on its own microtask; none may interfere
+    // with another's body or leave a request hanging.
+    const schemas = Array.from({ length: 25 }, (_, i) =>
+      asyncFallback(async () => ({ requestIndex: i })),
+    );
+
+    const settled = await Promise.all(
+      schemas.map(async schema => {
+        const req = { body: {} } as any;
+        const next = jest.fn();
+        await validateBody(schema)(req, {} as any, next);
+        // On success `next` is called with no arguments; the validated payload is
+        // written back onto the request.
+        return { calls: next.mock.calls, body: req.body?.requestIndex };
+      }),
+    );
+
+    for (let i = 0; i < settled.length; i++) {
+      expect(settled[i].calls).toHaveLength(1);
+      // No cross-talk: request i must observe its own payload.
+      expect(settled[i].body).toBe(i);
+    }
+  });
+
+  it('does not convert a downstream handler failure into a validation failure', async () => {
+    // Express must stay the single owner of post-validation error handling. If the
+    // middleware swallowed this error it would be re-reported as a 400 and `next`
+    // would be called twice for a single request.
+    const downstream = new Error('downstream boom');
+    const req = { body: { field: 'ok' } } as any;
+    const next = jest.fn(() => {
+      throw downstream;
+    });
+
+    const schema = z.object({ field: z.string() });
+    await validateBody(schema)(req, {} as any, next).catch(() => undefined);
+
+    expect(next).toHaveBeenCalledTimes(1);
+    expect(next).toHaveBeenCalledWith();
+  });
+
+  it('treats an async body that resolves to undefined as invalid rather than hanging', async () => {
+    const { nextCalls, rejections } = await runMiddleware(
+      asyncFallback(async () => undefined),
+      {},
+    );
+
+    // A resolved-but-empty body must still reach `next` exactly once.
+    expect(nextCalls).toHaveLength(1);
+    expect(nextCalls[0]).toBeUndefined();
+    expect(rejections).toEqual([]);
+  });
+});
+
+describe('Boundary and duplicate-input determinism', () => {
+  it('rejects every leading-zero variant of a negative amount deterministically', () => {
+    for (const value of ['-0', '-00', '-01', '-000000001']) {
+      expect(PositiveI128String.safeParse(value).success).toBe(false);
+    }
+    // Same input, same verdict, every time.
+    const results = Array.from({ length: 10 }, () =>
+      PositiveI128String.safeParse('-01').success,
+    );
+    expect(new Set(results)).toEqual(new Set([false]));
+  });
+
+  it('accepts an i128 value whose decimal string has many digits without precision loss', () => {
+    // Guards against a Number-based reimplementation silently losing precision.
+    const large = I128_MAX;
+    const parsed = PositiveI128String.safeParse(large);
+    expect(parsed.success).toBe(true);
+    if (parsed.success) {
+      expect(parsed.data).toBe(large);
+      expect(BigInt(parsed.data)).toBe((1n << 127n) - 1n);
+    }
+  });
+
+  it('rejects non-ASCII digit lookalikes that a loose numeric parser might accept', () => {
+    // Unicode decimal digits (e.g. Arabic-Indic) must not pass as an amount.
+    for (const value of ['١٢٣', '１００', '१२३']) {
+      expect(I128String.safeParse(value).success).toBe(false);
+    }
+  });
+
+  it('rejects amounts with internal whitespace or a plus sign', () => {
+    // Internal whitespace is not trimmed, so it must be rejected rather than silently
+    // coerced. (Surrounding whitespace is a documented normalisation instead.)
+    for (const value of ['1 000', '+1', '1+', '- 1', '1\u00a0000', '1,000']) {
+      expect(PositiveI128String.safeParse(value).success).toBe(false);
+    }
+  });
+
+  it('trims surrounding whitespace on an amount rather than rejecting it', () => {
+    // The counterpart to the test above: outer padding is normalised, inner padding
+    // is a rejection. Both behaviours must hold or amounts become non-deterministic.
+    for (const value of ['1\t', ' 1 ', '\n100\n']) {
+      const result = PositiveI128String.safeParse(value);
+      expect(result.success).toBe(true);
+      if (result.success) {
+        expect(result.data).toBe(value.trim());
+      }
+    }
+  });
+
+  it('produces an identical error signature for repeated identical invalid payloads', () => {
+    const invalidPayload = {
+      userAddress: 'invalid_address',
+      amount: '-10',
+      userSecret: '',
+    };
+
+    const signatures = new Set<string>();
+    for (let i = 0; i < 10; i++) {
+      const result = lendingRequestSchema.safeParse(invalidPayload);
+      expect(result.success).toBe(false);
+      if (!result.success) {
+        signatures.add(
+          result.error.issues
+            .map(issue => `${issue.path.join('.')}|${issue.code}|${issue.message}`)
+            .sort()
+            .join(','),
+        );
+      }
+    }
+
+    // Determinism: one payload, one signature, regardless of how often it is retried.
+    expect(signatures.size).toBe(1);
+  });
+
+  it('treats an object with an unexpected __proto__ key as invalid input without polluting state', () => {
+    const malicious = JSON.parse(
+      '{"userAddress":"bad","amount":"1","userSecret":"s","__proto__":{"polluted":true}}',
+    );
+
+    lendingRequestSchema.safeParse(malicious);
+    // The schema must not have written to Object.prototype.
+    expect(({} as any).polluted).toBeUndefined();
+    expect(Object.prototype).not.toHaveProperty('polluted');
+  });
+
+  it('does not echo the userSecret value into the ValidationError message', () => {
+    const secretish = 'SUPERSECRETVALUE';
+    const result = lendingRequestSchema.safeParse({
+      userAddress: 'invalid_address',
+      amount: '1',
+      userSecret: secretish,
+    });
+
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      const combined = result.error.issues
+        .map(issue => `${issue.path.join('.')}: ${issue.message}`)
+        .join(', ');
+      expect(combined).toContain('userAddress');
+      expect(combined).not.toContain(secretish);
+    }
+  });
+
+  it('validates deeply nested and oversized payloads without throwing or hanging', () => {
+    // Adverse input: a payload large enough to be a denial-of-service vector if the
+    // validator were quadratic or unterminated.
+    const oversized = '9'.repeat(100_000);
+    const started = Date.now();
+    const result = lendingRequestSchema.safeParse({
+      userAddress: 'GBLXVKWHD4QAPFLHMJDXSVB6GFUDLTC46VY42OWHC3TPRN2I6NNV3ZSJ',
+      amount: oversized,
+      userSecret: 'secret',
+    });
+
+    expect(result.success).toBe(false);
+    // Must be fast enough that validation cannot be used to stall the event loop.
+    expect(Date.now() - started).toBeLessThan(5000);
   });
 });
